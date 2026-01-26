@@ -39,15 +39,9 @@ use task_encoder::{EncodeFullError, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, CompType, LocalDeclData};
 
 use crate::encoders::{
-    self, FunctionCallEnc, MirBuiltinEnc, MirBuiltinEncTask, TyUseImpureEnc, WandEnc, WandEncTask,
-    mir_fn::{CallTaskDescription, RustSignature},
-    mir_shared::PureRvalueEnc,
-    ty::{
-        RustTyDecomposition,
-        generics::{GParams, GenericParamsEnc},
-        use_impure::TyUseImpure,
-        use_pure::{TyUsePure, TyUsePureEnc},
-    },
+    self, mir_fn::{CallTaskDescription, CallingCtxt, RustSignature}, mir_shared::PureRvalueEnc, ty::{
+        generics::{GParams, GenericParamsEnc}, use_impure::TyUseImpure, use_pure::{TyUsePure, TyUsePureEnc}, RustTyDecomposition
+    }, FunctionCallEnc, MirBuiltinEnc, MirBuiltinEncTask, TyUseImpureEnc, WandEnc, WandEncTask
 };
 
 use super::WandEncOutput;
@@ -1630,7 +1624,7 @@ impl<'vir, 'enc, E: TaskEncoder> mir::visit::Visitor<'vir> for ImpureEncVisitor<
                             })
                         })
                         .collect::<Vec<_>>();
-                    let pure_func_app = pure_func.call(snap_args);
+                    let pure_func_app = pure_func.call(CallingCtxt::Impure, snap_args);
 
                     let return_ty = destination.ty(self.local_decls, self.vcx.tcx()).ty;
                     let assign_stmt = self.ty_use_impure(return_ty).apply_method_assign(

@@ -1,6 +1,6 @@
 use prusti_rustc_interface::{middle::ty, span::def_id::DefId};
 use task_encoder::{EncodeFullResult, OutputRefAny, TaskEncoder, TaskEncoderDependencies};
-use vir::{FunctionIdn, Reify};
+use vir::{CastType, FunctionIdn, Reify};
 
 use crate::encoders::{
     MirLocalDefEnc, MirLocalDefEncTask, MirPureEnc, MirPureEncTask, MirSpecEnc, Pure, PureKind,
@@ -11,6 +11,11 @@ use crate::encoders::{
 // Function wrapper
 
 pub struct FunctionCallEnc;
+
+pub enum CallingCtxt {
+    Pure,
+    Impure,
+}
 
 #[derive(Debug, Clone)]
 pub struct FunctionCallEncOutput<'vir> {
@@ -23,6 +28,7 @@ pub struct FunctionCallEncOutput<'vir> {
 impl<'vir> FunctionCallEncOutput<'vir> {
     pub fn call<Curr, Next>(
         &self,
+        calling_ctxt: CallingCtxt,
         mut args: Vec<vir::ExprGenSnap<'vir, Curr, Next>>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
         assert_eq!(self.inputs.len(), args.len());
@@ -30,11 +36,18 @@ impl<'vir> FunctionCallEncOutput<'vir> {
         for (arg, caster) in a {
             *arg = caster.cast_to_callee_ctx(*arg);
         }
-        let call = self.function.function_ref.call()(
-            &args,
-            self.ty_args.get_ty(),
-            self.ty_args.get_const(),
-        );
+        let call = match calling_ctxt {
+            CallingCtxt::Pure => self.function.domain_fn_ref.call()(
+                &args,
+                self.ty_args.get_ty(),
+                self.ty_args.get_const(),
+            ),
+            CallingCtxt::Impure => self.function.caller_fn_ref.call()(
+                &args,
+                self.ty_args.get_ty(),
+                self.ty_args.get_const(),
+            ),
+        };
         self.output.cast_to_caller_ctx(call)
     }
 }
@@ -90,14 +103,17 @@ struct FunctionEnc;
 
 #[derive(Debug, Clone)]
 struct FunctionEncOutputRef<'vir> {
-    function_ref: FunctionIdn<'vir, (vir::ManySnap, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
+    domain_fn_ref: FunctionIdn<'vir, (vir::ManySnap, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
+    caller_fn_ref: FunctionIdn<'vir, (vir::ManySnap, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
 }
 
 impl<'vir> OutputRefAny for FunctionEncOutputRef<'vir> {}
 
 #[derive(Debug, Clone, Copy)]
 struct FunctionEncOutput<'vir> {
-    function: vir::Function<'vir>,
+    defn_axiom: Option<vir::DomainAxiom<'vir>>,
+    domain_fn: vir::DomainFunction<'vir>,
+    caller_fn: vir::Function<'vir>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,27 +146,65 @@ impl TaskEncoder for FunctionEnc {
 
             tracing::debug!("encoding {def_id:?}");
 
-            let function_ident =
-                vir::vir_format_identifier!(vcx, "f_{}", vcx.tcx().def_path_str(def_id));
             let arg_types = vcx.alloc_slice(&local_defs.snap_ty_args().collect::<Vec<_>>());
             let return_type = local_defs.snap_ty_return();
             let params = GParams::from(def_id);
             let generics = deps.require_dep::<GenericParamsEnc>(params)?;
-            let function_ref = FunctionIdn::new(
-                function_ident,
-                (arg_types, generics.ty_args(), generics.const_args()),
-                return_type,
+
+            let domain_fn_ref = {
+                let ident =
+                    vir::vir_format_identifier!(vcx, "f_{}", vcx.tcx().def_path_str(def_id));
+                FunctionIdn::new(
+                    ident,
+                    (arg_types, generics.ty_args(), generics.const_args()), // NOTE: look here
+                    return_type,
+                )
+            };
+
+            let caller_fn_ref = {
+                let ident =
+                    vir::vir_format_identifier!(vcx, "caller_{}", vcx.tcx().def_path_str(def_id));
+                FunctionIdn::new(
+                    ident,
+                    (arg_types, generics.ty_args(), generics.const_args()), // NOTE: look here
+                    return_type,
+                )
+            };
+
+            deps.emit_output_ref(
+                def_id,
+                FunctionEncOutputRef {
+                    domain_fn_ref,
+                    caller_fn_ref,
+                },
+            )?;
+
+            let domain_fn = vcx.mk_domain_function(domain_fn_ref, false, None);
+
+            let domain_fn_app = domain_fn_ref(
+                &local_defs
+                    .local_decl_args()
+                    .map(|decl| vcx.mk_local_ex(decl))
+                    .collect::<Vec<_>>(),
+                &generics
+                    .ty_decls()
+                    .iter()
+                    .map(|decl| vcx.mk_local_ex(decl))
+                    .collect::<Vec<_>>(),
+                &generics
+                    .const_decls()
+                    .iter()
+                    .map(|decl| vcx.mk_local_ex(decl))
+                    .collect::<Vec<_>>(),
             );
-            deps.emit_output_ref(def_id, FunctionEncOutputRef { function_ref })?;
 
             let substs = ty::GenericArgs::identity_for_item(vcx.tcx(), def_id);
             let spec = deps.require_dep::<MirSpecEnc>((def_id, true))?;
 
-            let expr = if trusted {
+            let defn_axiom = if trusted {
                 None
             } else {
-                // Encode the body of the function
-                let expr = deps
+                let fn_body = deps
                     .require_dep::<MirPureEnc>(MirPureEncTask {
                         encoding_depth: 0,
                         kind: PureKind::Pure,
@@ -160,23 +214,34 @@ impl TaskEncoder for FunctionEnc {
                         caller_def_id: None,
                     })?
                     .expr;
-                let expr = expr.reify(vcx, (def_id, spec.pre_args));
+                let fn_body = fn_body.reify(vcx, (def_id, spec.pre_args));
                 assert!(
-                    expr.ty() == return_type,
+                    fn_body.ty() == return_type,
                     "expected {:?}, got {:?}",
                     return_type,
-                    expr.ty()
+                    fn_body.ty()
                 );
-                Some(expr)
-            };
 
-            // TODO: type preconditions do not currently work
-            /*
-            let arg_type_assertions = local_defs.args().map(|arg| {
-                let snap = vcx.mk_local_ex(arg.local_snap);
-                generics.ty_assertion(deps, snap, arg.rust_ty)
-            }).collect::<Vec<_>>();
-            */
+                let axiom_body = {
+                    let mut qvars = local_defs
+                        .local_decl_args()
+                        .map(|decl| decl.as_dyn())
+                        .collect::<Vec<_>>();
+                    qvars.extend(generics.ty_decls().iter().map(|decl| decl.as_dyn()));
+                    qvars.extend(generics.const_decls().iter().map(|decl| decl.as_dyn()));
+
+                    vcx.mk_forall_expr(
+                        vcx.alloc_slice(&qvars),
+                        vcx.alloc_slice(&[vcx.mk_trigger(&[domain_fn_app])]),
+                        vcx.mk_eq_expr(domain_fn_app, fn_body),
+                    )
+                };
+
+                let axiom_ident =
+                    vir::vir_format_identifier!(vcx, "defn_{}", vcx.tcx().def_path_str(def_id));
+
+                Some(vcx.mk_domain_axiom(axiom_ident, axiom_body))
+            };
 
             tracing::debug!("finished {def_id:?}");
 
@@ -193,21 +258,45 @@ impl TaskEncoder for FunctionEnc {
             posts.extend(spec.posts);
 
             let func_args = local_defs.local_decl_args().collect::<Vec<_>>();
-            let function = vcx.mk_function(
-                function_ref,
+            let caller_fn = vcx.mk_function(
+                caller_fn_ref,
                 (&func_args, generics.ty_decls(), generics.const_decls()),
                 vcx.alloc_slice(&pres),
                 vcx.alloc_slice(&posts),
-                expr.is_none().then_some(&vir::DecreasesGenData::Star),
-                expr,
+                None,
+                Some(domain_fn_app),
             );
-            Ok((FunctionEncOutput { function }, ()))
+
+            Ok((
+                FunctionEncOutput {
+                    defn_axiom,
+                    domain_fn,
+                    caller_fn,
+                },
+                (),
+            ))
         })
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
+        let mut defn_axioms = Vec::new();
+        let mut domain_fns = Vec::new();
         for output in Self::all_outputs_local_no_errors() {
-            program.add_function(output.function);
+            if let Some(axiom) = output.defn_axiom {
+                defn_axioms.push(axiom)
+            };
+            domain_fns.push(output.domain_fn);
+            program.add_function(output.caller_fn);
         }
+        vir::with_vcx(|vcx| {
+            let domain = vcx.mk_domain(
+                vir::ViperIdent::new("PureFns"),
+                &[],
+                vcx.alloc_slice(&defn_axioms),
+                vcx.alloc_slice(&domain_fns),
+                None,
+            );
+            program.add_domain(domain);
+        });
     }
 }
